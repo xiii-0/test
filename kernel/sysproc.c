@@ -6,6 +6,40 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
+
+uint64
+sys_sysinfo(void)
+{
+  uint64 addr; //virtual address pointing to a struct sysinfo
+  struct sysinfo info;
+  struct proc *p = myproc();
+  
+  if (argaddr(0, &addr) < 0)
+	  return -1;
+  // get the number of bytes of free memory
+  info.freemem = free_mem();
+  // get the number of processes whose state is not UNUSED
+  info.nproc = nproc();
+
+  if (copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1;
+  
+  return 0;
+}
+
+uint64
+sys_trace(void)
+{
+  int mask;
+  // get the value of a0 and return to mask
+  if(argint(0, &mask) < 0)
+    return -1;
+  
+  // pass the mask to current mask process
+  myproc()->mask = mask;
+  return 0;
+}
 
 uint64
 sys_exit(void)
