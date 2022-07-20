@@ -6,6 +6,9 @@
 #include "defs.h"
 #include "fs.h"
 
+#include "spinlock.h"
+#include "proc.h"
+
 /*
  * the kernel's page table.
  */
@@ -52,7 +55,7 @@ kvminit()
 void
 kvminithart()
 {
-  w_satp(MAKE_SATP(kernel_pagetable));
+  w_satp(MAKE_SATP(kernel_pagetable)); // 将根页表页写入satp
   sfence_vma();
 }
 
@@ -73,19 +76,20 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
 {
   if(va >= MAXVA)
     panic("walk");
-
-  for(int level = 2; level > 0; level--) {
-    pte_t *pte = &pagetable[PX(level, va)];
+  for (int level = 2; level > 0; level--)
+  {                                         // 划分为三级
+    pte_t *pte = &pagetable[PX(level, va)]; // 每次取出虚拟地址va中的9个bit
+    // PTE中的PTE_V表明了它的物理地址字段是否有效
     if(*pte & PTE_V) {
-      pagetable = (pagetable_t)PTE2PA(*pte);
+      pagetable = (pagetable_t)PTE2PA(*pte); // 切换到下一级页表
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      if (!alloc || (pagetable = (pde_t *)kalloc()) == 0) // 如果设置了alloc就分配物理页面，并切换到下一级
         return 0;
       memset(pagetable, 0, PGSIZE);
-      *pte = PA2PTE(pagetable) | PTE_V;
+      *pte = PA2PTE(pagetable) | PTE_V; // 将分配的物理地址写入PTE，并设置PTE_V
     }
   }
-  return &pagetable[PX(0, va)];
+  return &pagetable[PX(0, va)]; // 返回图3.2中L0指向的那一级PTE
 }
 
 // Look up a virtual address, return the physical address,
@@ -131,8 +135,8 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
+
+  pte = walk(myproc()->kpagetable, va, 0); //写入进程的内核页表
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -151,14 +155,14 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   uint64 a, last;
   pte_t *pte;
 
-  a = PGROUNDDOWN(va);
-  last = PGROUNDDOWN(va + size - 1);
+  a = PGROUNDDOWN(va);               //找到开始映射的地址对齐的下界
+  last = PGROUNDDOWN(va + size - 1); // 例如映射的size为4096字节，实际地址范围是上是0~4095
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
       panic("remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    *pte = PA2PTE(pa) | perm | PTE_V; // 在PTE中写入映射的物理地址和PTE权限
     if(a == last)
       break;
     a += PGSIZE;
@@ -184,7 +188,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
       panic("uvmunmap: not mapped");
-    if(PTE_FLAGS(*pte) == PTE_V)
+    if (PTE_FLAGS(*pte) == PTE_V) // 页表中标志位应当还设立了RWX等标志位，而页目录表中仅有PTE_V
       panic("uvmunmap: not a leaf");
     if(do_free){
       uint64 pa = PTE2PA(*pte);
@@ -295,7 +299,7 @@ void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+    uvmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 1); //在用户内存空间工作，所以虚拟地址起始为0
   freewalk(pagetable);
 }
 
@@ -379,23 +383,24 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  return copyin_new(pagetable, dst, srcva, len);
+  // uint64 n, va0, pa0;
 
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+  // while(len > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0); //计算本页表内需要复制的长度
+  //   if (n > len)                //复制的长度只在一个页面中
+  //     n = len;
+  //   memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  //   len -= n;
+  //   dst += n;
+  //   srcva = va0 + PGSIZE;
+  // }
+  // return 0;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +410,111 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  return copyinstr_new(pagetable, dst, srcva, max);
+  // uint64 n, va0, pa0;
+  // int got_null = 0;
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
+  // while(got_null == 0 && max > 0){
+  //   va0 = PGROUNDDOWN(srcva);
+  //   pa0 = walkaddr(pagetable, va0);
+  //   if(pa0 == 0)
+  //     return -1;
+  //   n = PGSIZE - (srcva - va0);
+  //   if(n > max)
+  //     n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
+  //   char *p = (char *) (pa0 + (srcva - va0));
+  //   while(n > 0){
+  //     if(*p == '\0'){
+  //       *dst = '\0';
+  //       got_null = 1;
+  //       break;
+  //     } else {
+  //       *dst = *p;
+  //     }
+  //     --n;
+  //     --max;
+  //     p++;
+  //     dst++;
+  //   }
+
+  //   srcva = va0 + PGSIZE;
+  // }
+  // if(got_null){
+  //   return 0;
+  // } else {
+  //   return -1;
+  // }
+}
+
+/**
+ * @brief vmprint 打印页表
+ * @param pagetable 所要打印的页表
+ * @param level 页表的层级
+ */
+void vmprint_r(pagetable_t pagetable, int level)
+{
+  if (level < 0)
+    return;
+
+  for (int i = 0; i < 512; ++i)
+  {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V)
+    {
+      for (int j = 2; j > level; --j)
+      {
+        printf(".. ");
       }
-      --n;
-      --max;
-      p++;
-      dst++;
+      uint64 child = PTE2PA(pte);
+      printf("..%d: pte %p pa %p\n", i, pte, child);
+      vmprint_r((pagetable_t)child, level - 1);
     }
+  }
+}
 
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+/**
+ * @brief vmprint 打印页表
+ * @param pagetable 所要打印的页表
+ */
+void vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprint_r(pagetable, 2);
+}
+
+/**
+ * @brief kvmreloadhart 向satp中重新写入页表
+ * @param pagetable 要写入的页表
+ */
+void kvmreloadhart(pagetable_t pagetable)
+{
+  w_satp(MAKE_SATP(pagetable));
+  sfence_vma();
+}
+
+/**
+ * @brief pagemap 为指定的页表建立映射，相对于mappages，仅仅是参数顺序的改变
+ * @param pagetable 指定页表
+ * @param va 虚拟地址
+ * @param pa 物理地址
+ * @param sz 映射的地址大小
+ * @param perm 权限
+ * @return 0成功 -1失败
+ */
+int pagemap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  return mappages(pagetable, va, sz, pa, perm);
+}
+
+/**
+ * @brief ukvmfree 模拟uvmfree释放进程的内核页表，但不释放物理空间
+ * @param kpagetable 指定页表
+ * @param sz 大小
+ */
+void ukvmfree(pagetable_t kpagetable, uint64 sz)
+{
+  if (sz > 0)
+    uvmunmap(kpagetable, 0, PGROUNDUP(sz) / PGSIZE, 0); //在用户内存空间工作，所以虚拟地址起始为0
+  freewalk(kpagetable);
 }
