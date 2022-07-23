@@ -80,6 +80,13 @@ usertrap(void)
   if(which_dev == 2)
     yield();
 
+  if(which_dev==2){//control process alarm when timer interrupt
+    if(p->ticks>0&&--p->remainticks==0){
+      p->trapframe_bak=*p->trapframe;
+      p->trapframe->epc=(uint64)p->handler;
+    }
+  }
+
   usertrapret();
 }
 
