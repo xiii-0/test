@@ -5,6 +5,7 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
 
 /*
  * the kernel's page table.
@@ -153,6 +154,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
   uint64 a, last;
   pte_t *pte;
+  struct spinlock lock;
 
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
@@ -163,7 +165,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
       panic("remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if (pa>=KERNBASE){
+      // acquire(&lock);
       refNum[(pa - KERNBASE)/PGSIZE] += 1;
+      // release(&lock);
     }
     if(a == last)
       break;
